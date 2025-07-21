@@ -86,23 +86,23 @@ def find_speech_balloons(sam_masks, original_image, filter_params):
             
     return filtered_balloons
 
-def process_batch(sam_model, image_bytes_list, worker_config, confidence_list):
-    """Processa um lote de imagens."""
-    results = []
-    images = [cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR) for img_bytes in image_bytes_list]
-    
-    for i, image_original in enumerate(images):
-        if image_original is None:
-            log.error(f"Falha ao decodificar a imagem no índice {i}.")
-            results.append((None, None))
-            continue
+def process_image(sam_model, image_bytes, worker_config, confidence=0.4):
+    """
+    Processa uma imagem, detecta balões e gera imagem de diagnóstico e anotações.
+    """
+    try:
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        image_original = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        confidence = confidence_list[i]
+        if image_original is None:
+            log.error("Falha ao decodificar a imagem.")
+            return None, None
+
         sam_results = sam_model(image_original, stream=False, verbose=False, conf=confidence)
         
         masks = sam_results[0].masks if sam_results and sam_results[0].masks else []
         detected_balloons = find_speech_balloons(masks, image_original, worker_config["BALLOON_FILTER_PARAMS"])
-        log.info(f"Encontrados {len(detected_balloons)} balões válidos na imagem {i}.")
+        log.info(f"Encontrados {len(detected_balloons)} balões válidos.")
 
         diag_image = image_original.copy()
         for mask in detected_balloons:
@@ -130,6 +130,8 @@ def process_batch(sam_model, image_bytes_list, worker_config, confidence_list):
                 )
             annotation_text = "\n".join(annotation_lines)
 
-        results.append((result_image_bytes, annotation_text))
+        return result_image_bytes, annotation_text
 
-    return results
+    except Exception as e:
+        log.error(f"Ocorreu um erro inesperado durante o processamento da imagem: {e}", exc_info=True)
+        return None, None
