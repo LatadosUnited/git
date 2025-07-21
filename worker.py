@@ -21,6 +21,11 @@ worker_id = str(uuid.uuid4())
 worker_status = "Inicializando"
 worker_config = {}
 
+# --- CABEÇALHO PARA PULAR O AVISO DO NGROK ---
+# Este cabeçalho será usado em todas as requisições para o master
+NGROK_HEADER = {'ngrok-skip-browser-warning': 'true'}
+
+
 def send_heartbeat(master_url):
     """
     Envia um status (heartbeat) para o master periodicamente em segundo plano.
@@ -29,27 +34,57 @@ def send_heartbeat(master_url):
     while True:
         try:
             payload = {"worker_id": worker_id, "status": worker_status}
-            requests.post(f"{master_url}/worker/heartbeat", json=payload, timeout=10)
+            # Adicionado o cabeçalho na requisição de heartbeat
+            requests.post(f"{master_url}/worker/heartbeat", json=payload, timeout=10, headers=NGROK_HEADER)
         except requests.exceptions.RequestException as e:
             logging.warning(f"Não foi possível enviar heartbeat ao master: {e}")
         time.sleep(15)
 
 def download_file(url, file_path):
-    # (sem alterações)
-    ...
+    # Esta função baixa o modelo de uma URL pública, não precisa do header
+    try:
+        response = requests.get(url, stream=True, timeout=30)
+        response.raise_for_status()
+        total_size = int(response.headers.get("content-length", 0))
+        with tqdm(
+            total=total_size,
+            unit="iB",
+            unit_scale=True,
+            desc=f"Baixando {os.path.basename(file_path)}",
+        ) as pbar:
+            with open(file_path, "wb") as f:
+                for data in response.iter_content(chunk_size=1024):
+                    pbar.update(len(data))
+                    f.write(data)
+        return True
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Falha no download: {e}")
+        return False
 
 def initialize_model(model_name, model_url):
     # (sem alterações)
-    ...
+    if not os.path.exists(model_name):
+        logging.info(f"Modelo '{model_name}' não encontrado. Baixando...")
+        if not download_file(model_url, model_name):
+            return None
+    try:
+        logging.info("Carregando modelo SAM na memória...")
+        model = SAM(model_name)
+        logging.info("Modelo carregado com sucesso.")
+        return model
+    except Exception as e:
+        logging.critical(f"Erro fatal ao carregar o modelo SAM: {e}", exc_info=True)
+        return None
 
 def discover_master_url(discovery_url):
     """
     Função para descobrir a URL real do master (ngrok) a partir de um ponto de entrada fixo.
     """
-    for attempt in range(5): # Tenta descobrir 5 vezes
+    for attempt in range(5):
         try:
             logging.info(f"Tentando descobrir a URL do Master em '{discovery_url}' (tentativa {attempt + 1}/5)...")
-            response = requests.get(f"{discovery_url}/get_ngrok_url", timeout=10)
+            # Adicionado o cabeçalho na requisição de descoberta
+            response = requests.get(f"{discovery_url}/get_ngrok_url", timeout=10, headers=NGROK_HEADER)
             response.raise_for_status()
             data = response.json()
             
@@ -62,7 +97,9 @@ def discover_master_url(discovery_url):
 
         except requests.exceptions.RequestException as e:
             logging.error(f"Erro ao contatar o servidor de descoberta: {e}")
-        
+        except requests.exceptions.JSONDecodeError as e:
+            logging.error(f"Falha ao decodificar JSON do servidor de descoberta. Resposta recebida: {response.text}")
+
         logging.info("Aguardando 10 segundos antes de tentar novamente...")
         time.sleep(10)
     
@@ -72,12 +109,15 @@ def discover_master_url(discovery_url):
 def get_master_config(master_url):
     """Obtém a configuração do master."""
     try:
-        response = requests.get(f"{master_url}/config", timeout=15)
+        # Adicionado o cabeçalho na requisição de configuração
+        response = requests.get(f"{master_url}/config", timeout=15, headers=NGROK_HEADER)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
         logging.error(f"Não foi possível obter a configuração do master: {e}")
-        return None
+    except requests.exceptions.JSONDecodeError as e:
+        logging.error(f"Falha ao decodificar JSON de configuração. Resposta recebida: {response.text}")
+    return None
 
 def start_worker(discovery_url):
     """
@@ -86,12 +126,10 @@ def start_worker(discovery_url):
     global worker_status, worker_config
     logging.info(f">>> INICIANDO WORKER (ID: {worker_id}) <<<")
 
-    # Passo 1: Descobrir a URL real do Master
     master_url = discover_master_url(discovery_url)
     if not master_url:
-        return # Encerra se não conseguir descobrir o master
+        return
 
-    # Passo 2: Obter a configuração do Master, usando a URL descoberta
     worker_config = get_master_config(master_url)
     if not worker_config:
         worker_status = "Falha (Config)"
@@ -109,14 +147,14 @@ def start_worker(discovery_url):
     
     BATCH_SIZE = worker_config.get("BATCH_SIZE", 1)
 
-    # Loop principal (usa a variável `master_url` descoberta)
     while True:
         try:
             worker_status = "Ocioso"
             logging.info(f"Solicitando novo lote de tarefas (tamanho: {BATCH_SIZE}) ao master em {master_url}...")
 
             get_job_url = f"{master_url}/get_batch_jobs?worker_id={worker_id}&version={WORKER_VERSION}&size={BATCH_SIZE}"
-            response = requests.get(get_job_url, timeout=60)
+            # Adicionado o cabeçalho na requisição de tarefas
+            response = requests.get(get_job_url, timeout=60, headers=NGROK_HEADER)
 
             if response.status_code == 426:
                 logging.error("Versão do worker desatualizada. Por favor, atualize o worker e reinicie.")
@@ -162,8 +200,9 @@ def start_worker(discovery_url):
                     for attempt in range(3):
                         try:
                             logging.info(f"Enviando lote de {len(results_to_submit)} resultados (tentativa {attempt + 1}/3)...")
+                            # Adicionado o cabeçalho na requisição de submissão
                             submit_response = requests.post(
-                                f"{master_url}/submit_batch_results", json={"results": results_to_submit}, timeout=60
+                                f"{master_url}/submit_batch_results", json={"results": results_to_submit}, timeout=60, headers=NGROK_HEADER
                             )
                             submit_response.raise_for_status()
                             submitted_successfully = True
@@ -189,9 +228,7 @@ def start_worker(discovery_url):
 
         except requests.exceptions.RequestException as e:
             worker_status = "Erro de Conexão"
-            logging.error(
-                f"Erro de conexão com o master: {e}. Tentando novamente em {worker_config.get('WORKER_RETRY_DELAY', 15)}s."
-            )
+            logging.error(f"Erro de conexão com o master: {e}. Tentando novamente em {worker_config.get('WORKER_RETRY_DELAY', 15)}s.")
             time.sleep(worker_config.get('WORKER_RETRY_DELAY', 15))
         except Exception as e:
             worker_status = "Erro Crítico"
@@ -200,8 +237,6 @@ def start_worker(discovery_url):
 
 
 if __name__ == "__main__":
-    # O URL de descoberta agora está fixo no código.
-    # Não é mais necessário passá-lo como argumento.
     DISCOVERY_URL = "http://147.185.221.22:40943"
     
     print(f"Uso: python {sys.argv[0]}")
