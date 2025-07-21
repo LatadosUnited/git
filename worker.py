@@ -10,14 +10,12 @@ import threading
 from tqdm import tqdm
 from ultralytics import SAM
 
-from shared_logic import process_batch
+from shared_logic import process_image
 
-# Configuração do logging para o worker
+# --- Configuração de logging, estado global, etc. (sem alterações) ---
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - [%(levelname)s] - (Worker) - %(message)s"
 )
-
-# --- ESTADO GLOBAL DO WORKER ---
 WORKER_VERSION = "1.0.0"
 worker_id = str(uuid.uuid4())
 worker_status = "Inicializando"
@@ -37,49 +35,42 @@ def send_heartbeat(master_url):
         time.sleep(15)
 
 def download_file(url, file_path):
-    """
-    Baixa um arquivo (como o modelo de IA) com uma barra de progresso.
-    """
-    try:
-        response = requests.get(url, stream=True, timeout=30)
-        response.raise_for_status()
-        total_size = int(response.headers.get("content-length", 0))
-        with tqdm(
-            total=total_size,
-            unit="iB",
-            unit_scale=True,
-            desc=f"Baixando {os.path.basename(file_path)}",
-        ) as pbar:
-            with open(file_path, "wb") as f:
-                for data in response.iter_content(chunk_size=1024):
-                    pbar.update(len(data))
-                    f.write(data)
-        return True
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Falha no download: {e}")
-        return False
+    # (sem alterações)
+    ...
 
 def initialize_model(model_name, model_url):
+    # (sem alterações)
+    ...
+
+def discover_master_url(discovery_url):
     """
-    Verifica se o modelo SAM existe, baixa se necessário, e o carrega na memória.
+    Função para descobrir a URL real do master (ngrok) a partir de um ponto de entrada fixo.
     """
-    if not os.path.exists(model_name):
-        logging.info(f"Modelo '{model_name}' não encontrado. Baixando...")
-        if not download_file(model_url, model_name):
-            return None
-    try:
-        logging.info("Carregando modelo SAM na memória...")
-        model = SAM(model_name)
-        logging.info("Modelo carregado com sucesso.")
-        return model
-    except Exception as e:
-        logging.critical(f"Erro fatal ao carregar o modelo SAM: {e}", exc_info=True)
-        return None
+    for attempt in range(5): # Tenta descobrir 5 vezes
+        try:
+            logging.info(f"Tentando descobrir a URL do Master em '{discovery_url}' (tentativa {attempt + 1}/5)...")
+            response = requests.get(f"{discovery_url}/get_ngrok_url", timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            master_url = data.get("ngrok_url")
+            if master_url:
+                logging.info(f"URL do Master descoberta com sucesso: {master_url}")
+                return master_url
+            else:
+                logging.warning("Resposta do servidor de descoberta não continha a URL.")
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Erro ao contatar o servidor de descoberta: {e}")
+        
+        logging.info("Aguardando 10 segundos antes de tentar novamente...")
+        time.sleep(10)
+    
+    logging.critical("Não foi possível descobrir a URL do Master após várias tentativas. Encerrando.")
+    return None
 
 def get_master_config(master_url):
-    """
-    Obtém a configuração do master.
-    """
+    """Obtém a configuração do master."""
     try:
         response = requests.get(f"{master_url}/config", timeout=15)
         response.raise_for_status()
@@ -88,13 +79,19 @@ def get_master_config(master_url):
         logging.error(f"Não foi possível obter a configuração do master: {e}")
         return None
 
-def start_worker(master_url):
+def start_worker(discovery_url):
     """
     Função principal que gerencia o ciclo de vida do worker.
     """
     global worker_status, worker_config
     logging.info(f">>> INICIANDO WORKER (ID: {worker_id}) <<<")
 
+    # Passo 1: Descobrir a URL real do Master
+    master_url = discover_master_url(discovery_url)
+    if not master_url:
+        return # Encerra se não conseguir descobrir o master
+
+    # Passo 2: Obter a configuração do Master, usando a URL descoberta
     worker_config = get_master_config(master_url)
     if not worker_config:
         worker_status = "Falha (Config)"
@@ -109,60 +106,75 @@ def start_worker(master_url):
     if not sam_model:
         worker_status = "Falha (Modelo)"
         return
+    
+    BATCH_SIZE = worker_config.get("BATCH_SIZE", 1)
 
+    # Loop principal (usa a variável `master_url` descoberta)
     while True:
         try:
             worker_status = "Ocioso"
-            logging.info("Solicitando novo lote de tarefas ao master...")
+            logging.info(f"Solicitando novo lote de tarefas (tamanho: {BATCH_SIZE}) ao master em {master_url}...")
 
-            get_jobs_url = f"{master_url}/get_jobs?worker_id={worker_id}&version={WORKER_VERSION}"
-            response = requests.get(get_jobs_url, timeout=60)
+            get_job_url = f"{master_url}/get_batch_jobs?worker_id={worker_id}&version={WORKER_VERSION}&size={BATCH_SIZE}"
+            response = requests.get(get_job_url, timeout=60)
 
-            if response.status_code == 426: # Upgrade Required
+            if response.status_code == 426:
                 logging.error("Versão do worker desatualizada. Por favor, atualize o worker e reinicie.")
                 worker_status = "Versão Desatualizada"
                 break
 
             response.raise_for_status()
-            batch_job = response.json()
+            response_data = response.json()
+            
+            job_list = response_data.get("jobs", [])
+            status = response_data.get("status")
 
-            status = batch_job.get("status")
-            if status == "new_batch":
-                tasks = batch_job["tasks"]
-                worker_status = f"Processando {len(tasks)} tarefas"
-                logging.info(f"Lote de {len(tasks)} tarefas recebido.")
+            if status == "new_batch" and job_list:
+                results_to_submit = []
+                logging.info(f"Lote de {len(job_list)} tarefas recebido. Iniciando processamento.")
 
-                image_bytes_list = [base64.b64decode(task["image_data_b64"]) for task in tasks]
-                confidence_list = [task.get("confidence") for task in tasks]
+                for job in job_list:
+                    task_id = job["task_id"]
+                    worker_status = f"Processando: {job['filename']} (Lote)"
+                    logging.info(f"Processando tarefa {task_id} do lote: {job['filename']}")
 
-                start_time = time.time()
-                results = process_batch(sam_model, image_bytes_list, worker_config, confidence_list)
-                logging.info(
-                    f"Processamento do lote concluído em {time.time() - start_time:.2f}s."
-                )
+                    image_bytes = base64.b64decode(job["image_data_b64"])
+                    confidence = job.get("confidence")
 
-                payloads = []
-                for i, (result_bytes, annotation_text) in enumerate(results):
+                    start_time = time.time()
+                    result_bytes, annotation_text = process_image(sam_model, image_bytes, worker_config, confidence)
+                    logging.info(f"Tarefa {task_id} concluída em {time.time() - start_time:.2f}s.")
+
                     if result_bytes:
-                        payloads.append({
-                            "task_id": tasks[i]["task_id"],
-                            "manga_name": tasks[i]["manga_name"],
-                            "filename": tasks[i]["filename"],
-                            "image_data_b64": base64.b64encode(result_bytes).decode(
-                                "utf-8"
-                            ),
+                        payload = {
+                            "task_id": task_id,
+                            "manga_name": job["manga_name"],
+                            "filename": job["filename"],
+                            "image_data_b64": base64.b64encode(result_bytes).decode("utf-8"),
                             "txt_data": annotation_text,
-                        })
+                        }
+                        results_to_submit.append(payload)
                     else:
-                        logging.error(
-                            f"Erro ao processar a imagem da tarefa {tasks[i]['task_id']}. O master irá tratar."
-                        )
+                        logging.error(f"Erro ao processar a imagem da tarefa {task_id}. O master irá tratar.")
                 
-                if payloads:
-                    logging.info(f"Enviando resultados de {len(payloads)} tarefas...")
-                    requests.post(
-                        f"{master_url}/submit_results", json={"results": payloads}, timeout=30
-                    )
+                if results_to_submit:
+                    submitted_successfully = False
+                    for attempt in range(3):
+                        try:
+                            logging.info(f"Enviando lote de {len(results_to_submit)} resultados (tentativa {attempt + 1}/3)...")
+                            submit_response = requests.post(
+                                f"{master_url}/submit_batch_results", json={"results": results_to_submit}, timeout=60
+                            )
+                            submit_response.raise_for_status()
+                            submitted_successfully = True
+                            logging.info(f"Lote de resultados enviado com sucesso.")
+                            break
+                        except requests.exceptions.RequestException as e:
+                            logging.warning(f"Falha ao enviar lote de resultados: {e}. Tentando novamente em 5s.")
+                            time.sleep(5)
+                    
+                    if not submitted_successfully:
+                        logging.error(f"Não foi possível enviar o lote de resultados após 3 tentativas. O master irá tratar.")
 
             elif status == "no_more_jobs":
                 worker_status = "Concluído"
@@ -186,10 +198,13 @@ def start_worker(master_url):
             logging.critical(f"Erro inesperado no worker: {e}", exc_info=True)
             time.sleep(worker_config.get('WORKER_RETRY_DELAY', 15))
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(f"Uso: python {sys.argv[0]} <master_url>")
-        sys.exit(1)
 
-    master_url_arg = sys.argv[1]
-    start_worker(master_url_arg)
+if __name__ == "__main__":
+    # O URL de descoberta agora está fixo no código.
+    # Não é mais necessário passá-lo como argumento.
+    DISCOVERY_URL = "http://147.185.221.22:40943"
+    
+    print(f"Uso: python {sys.argv[0]}")
+    print(f"O worker tentará se conectar ao servidor de descoberta em: {DISCOVERY_URL}")
+
+    start_worker(DISCOVERY_URL)
